@@ -65,7 +65,7 @@ GET  /{short_cide}
 ```
 ## 3- High level design:
 
-
+![Screenshot 2025-09-18 202200.png](Screenshot%202025-09-18%20202200.png)
 
 ## 4- Deep Dives:
 
@@ -130,3 +130,4 @@ To solve this:
 ```
 ### Final design:
 
+![Screenshot 2025-09-18 202118.png](Screenshot%202025-09-18%20202118.png)
