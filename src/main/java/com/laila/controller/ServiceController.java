@@ -3,7 +3,12 @@ package com.laila.controller;
 import com.laila.dto.UrlDto;
 import com.laila.service.UrlService;
 import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.headers.Header;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.ExampleObject;
+import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -25,10 +30,23 @@ public class ServiceController {
     }
 
     @Operation(
-            summary = "Convert new url",
-            description = "Converts a long URL to a short code"
+            summary = "Convert new URL",
+            description = "Converts a long URL to a short code (random Base62). " +
+                    "Optionally accepts a custom alias and an expiration instant."
     )
-    @ApiResponse(responseCode = "200", description = "Short code created")
+    @ApiResponses({
+            @ApiResponse(
+                    responseCode = "200",
+                    description = "Short code created",
+                    content = @Content(
+                            mediaType = "text/plain",
+                            schema = @Schema(type = "string"),
+                            examples = @ExampleObject(value = "aB9x2Q7")
+                    )
+            ),
+            @ApiResponse(responseCode = "400", description = "Validation error"),
+            @ApiResponse(responseCode = "409", description = "Alias already exists")
+    })
     @PostMapping(
             path = "/create-short",
             consumes = MediaType.APPLICATION_JSON_VALUE,
@@ -41,9 +59,17 @@ public class ServiceController {
 
     @Operation(
             summary = "Redirect",
-            description = "Finds original URL from short code and redirects"
+            description = "Finds original URL from short code and redirects with HTTP 302."
     )
-    @ApiResponse(responseCode = "302", description = "Redirected to original URL")
+    @ApiResponses({
+            @ApiResponse(
+                    responseCode = "302",
+                    description = "Redirected to original URL",
+                    headers = @Header(name = "Location", description = "The original URL")
+            ),
+            @ApiResponse(responseCode = "404", description = "Short code not found"),
+            @ApiResponse(responseCode = "410", description = "Short code expired")
+    })
     @GetMapping("{shortUrl}")
     public ResponseEntity<Void> getAndRedirect(@PathVariable String shortUrl) {
         String url = urlService.getOriginalUrl(shortUrl);

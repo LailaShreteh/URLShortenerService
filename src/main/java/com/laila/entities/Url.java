@@ -1,40 +1,56 @@
 package com.laila.entities;
 
-import org.springframework.data.annotation.Id;
-import org.springframework.data.redis.core.RedisHash;
-import org.springframework.data.redis.core.TimeToLive;
-import org.springframework.data.redis.core.index.Indexed;
-
-import java.beans.Transient;
+import jakarta.persistence.*;
 import java.time.Instant;
-@RedisHash("urls")
+
+@Entity
+@Table(name = "short_urls",
+        indexes = {
+                @Index(name = "idx_short_urls_user", columnList = "user_id"),
+                @Index(name = "idx_short_urls_expires", columnList = "expires_at"),
+                @Index(name = "uq_short_urls_url_hash", columnList = "url_hash", unique = true) // optional
+        })
 public class Url {
 
     @Id
-    private Long id;
+    @Column(name = "code", length = 10, nullable = false, updatable = false)
+    private String code;
 
+    @Column(name = "long_url", nullable = false, columnDefinition = "TEXT")
     private String longUrl;
 
-    @Indexed
-    private String userId;
+    @Column(name = "url_hash") // optional (only if you want idempotency)
+    private String urlHash;
 
-    private Instant createdAt = Instant.now();
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "user_id")
+    private User user;
 
-    // Redis-enforced expiry (seconds). Null/0 => never expires
-    @TimeToLive
-    private Long ttlSeconds;
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
 
-    @Transient
-    public Instant getExpiresAt() {
-        return (ttlSeconds == null || ttlSeconds <= 0) ? null : createdAt.plusSeconds(ttlSeconds);
+    @Column(name = "expires_at")
+    private Instant expiresAt;
+
+    @Column(name = "is_custom", nullable = false)
+    private Boolean isCustom = false;
+
+    @Column(name = "status", nullable = false)
+    private Short status = 1;
+
+    @PrePersist
+    void onCreate() {
+        if (createdAt == null) createdAt = Instant.now();
+        if (isCustom == null) isCustom = false;
+        if (status == null) status = 1;
     }
 
-    public Long getId() {
-        return id;
+    public String getCode() {
+        return code;
     }
 
-    public void setId(Long id) {
-        this.id = id;
+    public void setCode(String code) {
+        this.code = code;
     }
 
     public String getLongUrl() {
@@ -45,12 +61,20 @@ public class Url {
         this.longUrl = longUrl;
     }
 
-    public String getUserId() {
-        return userId;
+    public String getUrlHash() {
+        return urlHash;
     }
 
-    public void setUserId(String userId) {
-        this.userId = userId;
+    public void setUrlHash(String urlHash) {
+        this.urlHash = urlHash;
+    }
+
+    public User getUser() {
+        return user;
+    }
+
+    public void setUser(User user) {
+        this.user = user;
     }
 
     public Instant getCreatedAt() {
@@ -61,19 +85,27 @@ public class Url {
         this.createdAt = createdAt;
     }
 
-    public Long getTtlSeconds() {
-        return ttlSeconds;
+    public Instant getExpiresAt() {
+        return expiresAt;
     }
 
-    public void setTtlSeconds(Long ttlSeconds) {
-        this.ttlSeconds = ttlSeconds;
+    public void setExpiresAt(Instant expiresAt) {
+        this.expiresAt = expiresAt;
     }
 
-    public Instant getCreatedDate() {
-        return createdAt;
+    public Boolean getCustom() {
+        return isCustom;
     }
 
-    public void setCreatedDate(Instant createdDate) {
-        this.createdAt = createdDate;
+    public void setCustom(Boolean custom) {
+        isCustom = custom;
+    }
+
+    public Short getStatus() {
+        return status;
+    }
+
+    public void setStatus(Short status) {
+        this.status = status;
     }
 }

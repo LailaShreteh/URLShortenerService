@@ -3,94 +3,82 @@ package com.laila.service;
 import com.laila.dto.UrlDto;
 import com.laila.entities.Url;
 import com.laila.exception.EntityNotFoundException;
-import com.laila.repository.UrlRepository;
 
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.ValueOperations;
+
+import com.laila.repository.UrlRepository;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
-import java.time.Duration;
 import java.time.Instant;
 
 @Service
 public class UrlService {
-    private final UrlRepository urlRepository;
-    private final Base62Converter base62Converter;
-    private final StringRedisTemplate redisTemplate;
-    private final IdSequence idSequence;
 
-    private static final String CODE_KEY_PREFIX = "url:code:";
-    private static final Duration DEFAULT_CACHE_TTL = Duration.ofHours(1);
+    private static final int CODE_LENGTH = 8;   // 7 is OK; 8 = virtually zero retries
+    private static final int MAX_RETRIES = 5;
 
-    public UrlService(UrlRepository urlRepository,
-                      Base62Converter base62Converter,
-                      StringRedisTemplate redisTemplate,
-                      IdSequence idSequence) {
-        this.urlRepository = urlRepository;
-        this.base62Converter = base62Converter;
-        this.redisTemplate = redisTemplate;
-        this.idSequence = idSequence;
+    private final UrlRepository repo;
+    private final UrlCache cache;
+
+    public UrlService(UrlRepository repo, UrlCache cache) {
+        this.repo = repo;
+        this.cache = cache;
     }
 
-    /** Creates a short code for the given long URL (normalizes scheme, writes through cache). */
-    public String convertToShortUrl(UrlDto dto) {
-        if (dto == null || !StringUtils.hasText(dto.getLongUrl())) {
-            throw new IllegalArgumentException("longUrl is required");
+    /** Create a short code (random Base62).  */
+    public String convertToShortUrl(UrlDto req) {
+        if (req == null || !StringUtils.hasText(req.getLongUrl())) {
+            throw new IllegalArgumentException("Url is required !");
         }
 
-        // normalize long URL
-        String normalized = normalize(dto.getLongUrl());
+        // 1) Custom alias path: DB enforces uniqueness on code
+        if (StringUtils.hasText(req.getAlias())) {
+            Url e = new Url();
+            e.setCode(req.getAlias().trim());
+            e.setLongUrl(normalize(req.getLongUrl()));
+            e.setCustom(true);
+            e.setCreatedAt(Instant.now());
+            e.setExpiresAt(req.getExpirationDate());
 
-        // generate numeric id (keeps Base62 algo unchanged)
-        long id = idSequence.next();
-
-        // build entity
-        Url url = new Url();
-        url.setId(id);
-        url.setLongUrl(normalized);
-        if (StringUtils.hasText(dto.getUserId())) {
-            url.setUserId(dto.getUserId());
-        }
-        url.setCreatedDate(Instant.now());
-        if (dto.getTtlSeconds() != null && dto.getTtlSeconds() > 0) {
-            url.setTtlSeconds(dto.getTtlSeconds());
+            Url saved = repo.save(e);
+            cache.set(saved.getCode(), saved.getLongUrl(), saved.getExpiresAt());
+            return saved.getCode();
         }
 
-        // persist
-        urlRepository.save(url);
+        // 2) Auto-generate random code and retry on very-rare duplicate
+        DataIntegrityViolationException last = null;
+        for (int i = 0; i < MAX_RETRIES; i++) {
+            String code = Base62Generator.randomCode(CODE_LENGTH);
+            try {
+                Url e = new Url();
+                e.setCode(code);
+                e.setLongUrl(normalize(req.getLongUrl()));
+                e.setCustom(false);
+                e.setCreatedAt(Instant.now());
+                e.setExpiresAt(req.getExpirationDate());
 
-        // encode and cache
-        String code = base62Converter.encode(id);
-        Duration ttl = (url.getTtlSeconds() != null && url.getTtlSeconds() > 0)
-                ? Duration.ofSeconds(url.getTtlSeconds())
-                : DEFAULT_CACHE_TTL;
-
-        redisTemplate.opsForValue().set(CODE_KEY_PREFIX + code, normalized, ttl);
-
-        return code;
+                Url saved = repo.save(e);
+                cache.set(saved.getCode(), saved.getLongUrl(), saved.getExpiresAt());
+                return saved.getCode();
+            } catch (DataIntegrityViolationException dup) {
+                last = dup; // collision on code (extremely rare) — try again
+            }
+        }
+        throw last != null ? last : new IllegalStateException("Failed to create short code");
     }
 
-    /** Resolves a short code back to the original URL (reads cache first, repopulates if miss). */
+    /** Resolve a short code → original URL. Uses Redis cache first, DB on miss, then warms cache. */
     public String getOriginalUrl(String code) {
-        ValueOperations<String, String> ops = redisTemplate.opsForValue();
+        String cached = cache.get(code);
+        if (cached != null) return cached;
 
-        // cache read (your test verifies this call)
-        String cached = ops.get(CODE_KEY_PREFIX + code);
-        if (cached != null) {
-            return cached;
-        }
+        Url e = repo.findById(code)
+                .filter(it -> it.getExpiresAt() == null || Instant.now().isBefore(it.getExpiresAt()))
+                .orElseThrow(() -> new EntityNotFoundException("URL not found or expired: " + code));
 
-        long id = base62Converter.decode(code);
-        Url url = urlRepository.findById(id)
-                .orElseThrow(() -> new EntityNotFoundException("URL not found for code: " + code));
-
-        Duration ttl = (url.getTtlSeconds() != null && url.getTtlSeconds() > 0)
-                ? Duration.ofSeconds(url.getTtlSeconds())
-                : DEFAULT_CACHE_TTL;
-
-        ops.set(CODE_KEY_PREFIX + code, url.getLongUrl(), ttl);
-        return url.getLongUrl();
+        cache.set(e.getCode(), e.getLongUrl(), e.getExpiresAt());
+        return e.getLongUrl();
     }
 
     // add http:// when scheme is missing

@@ -1,163 +1,141 @@
 package com.laila.service;
 
+import com.laila.entities.Url;
 import com.laila.exception.EntityNotFoundException;
 import com.laila.dto.UrlDto;
-import com.laila.entities.Url;
 import com.laila.repository.UrlRepository;
-import org.junit.Test;
-import org.junit.runner.RunWith;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
-import org.mockito.junit.MockitoJUnitRunner;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.ValueOperations;
+import org.mockito.Mockito;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.DataIntegrityViolationException;
 
-import java.time.Duration;
+
 import java.time.Instant;
 import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.junit.Assert.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
 
-@RunWith(MockitoJUnitRunner.class)
-public class UrlServiceTest {
+@ExtendWith(MockitoExtension.class)
+class UrlServiceTest {
 
-    @Mock
-    UrlRepository mockUrlRepository;
+    @Mock UrlRepository repo;
+    @Mock UrlCache cache;
 
-    @Mock
-    Base62Converter mockBase62Conversion;
-
-    @Mock
-    StringRedisTemplate mockRedisTemplate;
-
-    @Mock
-    ValueOperations<String, String> mockValueOps;
-
-    @Mock
-    IdSequence mockIdSequence;
-
-    @InjectMocks
-    UrlService urlService;
+    @InjectMocks UrlService service;
 
     @Test
-    public void convertToShortUrl_usesIdSequence_Base62_andSetsExactTTL() {
-        // Arrange
-        when(mockRedisTemplate.opsForValue()).thenReturn(mockValueOps);
-        when(mockIdSequence.next()).thenReturn(5L);
-        when(mockBase62Conversion.encode(5L)).thenReturn("f");
-
-        // Capture the entity we persist
-        ArgumentCaptor<Url> urlCaptor = ArgumentCaptor.forClass(Url.class);
-        when(mockUrlRepository.save(any(Url.class))).thenAnswer(inv -> inv.getArgument(0));
-
-        // Request with explicit TTL (e.g., 1 hour)
+    void create_withAlias_persists_and_warmsCache_noGenerator() {
         UrlDto dto = new UrlDto();
         dto.setLongUrl("https://www.wikipedia.org/");
-        dto.setTtlSeconds(3600L);
+        dto.setAlias("docs123");
+        dto.setExpirationDate(Instant.parse("2026-12-31T23:59:59Z"));
 
-        // Act
-        String code = urlService.convertToShortUrl(dto);
+        // repo.save returns the passed entity
+        when(repo.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
-        // Assert
-        assertEquals("f", code);
+        String code = service.convertToShortUrl(dto);
 
-        // 1) Id generator used
-        verify(mockIdSequence).next();
+        assertEquals("docs123", code);
+        // saved with alias as PK and normalized long url
+        ArgumentCaptor<Url> cap = ArgumentCaptor.forClass(Url.class);
+        verify(repo).save(cap.capture());
+        assertEquals("docs123", cap.getValue().getCode());
+        assertEquals("https://www.wikipedia.org/", cap.getValue().getLongUrl());
+        assertEquals(dto.getExpirationDate(), cap.getValue().getExpiresAt());
 
-        // 2) Base62 encode
-        verify(mockBase62Conversion).encode(5L);
-
-        // 3) Persisted with ttlSeconds = 3600 and created date set
-        verify(mockUrlRepository).save(urlCaptor.capture());
-        Url saved = urlCaptor.getValue();
-        assertEquals(Long.valueOf(3600L), saved.getTtlSeconds());
-
-        // 4) Cached with the exact TTL
-        verify(mockValueOps).set(eq("url:code:f"),
-                eq("https://www.wikipedia.org/"),
-                eq(Duration.ofSeconds(3600)));
+        // cache warmed with expiresAt
+        verify(cache).set("docs123", "https://www.wikipedia.org/", dto.getExpirationDate());
     }
 
     @Test
-    public void getOriginalUrl_cacheMiss_decodesToId_loadsFromRepo_andRepopulatesCacheWithTTL() {
-        // Arrange
-        when(mockRedisTemplate.opsForValue()).thenReturn(mockValueOps);
-        when(mockValueOps.get("url:code:h")).thenReturn(null); // cache miss
-        when(mockBase62Conversion.decode("h")).thenReturn(7L);
-
-        Url entity = new Url();
-        entity.setId(7L);
-        entity.setLongUrl("https://www.wikipedia.org/");
-        entity.setCreatedDate(Instant.now());
-        entity.setTtlSeconds(300L);
-        when(mockUrlRepository.findById(7L)).thenReturn(Optional.of(entity));
-
-        // Act
-        String original = urlService.getOriginalUrl("h");
-
-        // Assert
-        assertEquals("https://www.wikipedia.org/", original);
-        verify(mockValueOps).get("url:code:h");
-        verify(mockBase62Conversion).decode("h");
-        verify(mockUrlRepository).findById(7L);
-
-        // Service reuses the entity TTL when repopulating the cache:
-        verify(mockValueOps).set(eq("url:code:h"),
-                eq("https://www.wikipedia.org/"),
-                eq(Duration.ofSeconds(300)));
-    }
-
-    @Test
-    public void getOriginalUrl_cacheHit_returnsDirectlyWithoutRepo() {
-        // Arrange
-        when(mockRedisTemplate.opsForValue()).thenReturn(mockValueOps);
-        when(mockValueOps.get("url:code:h")).thenReturn("https://www.wikipedia.org/");
-
-        // Act
-        String original = urlService.getOriginalUrl("h");
-
-        // Assert
-        assertEquals("https://www.wikipedia.org/", original);
-        verify(mockValueOps).get("url:code:h");
-        verifyNoInteractions(mockUrlRepository);
-    }
-
-    @Test(expected = EntityNotFoundException.class)
-    public void getOriginalUrl_expiredByTTL_behavesAsNotFound() {
-        // Arrange: cache miss, decode ok, but repo returns empty because Redis TTL evicted it
-        when(mockRedisTemplate.opsForValue()).thenReturn(mockValueOps);
-        when(mockValueOps.get("url:code:x")).thenReturn(null);
-        when(mockBase62Conversion.decode("x")).thenReturn(42L);
-        when(mockUrlRepository.findById(42L)).thenReturn(Optional.empty());
-
-        // Act + Assert
-        urlService.getOriginalUrl("x");
-    }
-
-    @Test
-    public void convertToShortUrl_normalizesScheme_andSetsDefaultTTLIfMissing() {
-        // Arrange
-        when(mockRedisTemplate.opsForValue()).thenReturn(mockValueOps);
-        when(mockIdSequence.next()).thenReturn(9L);
-        when(mockBase62Conversion.encode(9L)).thenReturn("j");
-        when(mockUrlRepository.save(any(Url.class))).thenAnswer(inv -> inv.getArgument(0));
-
+    void create_autoGenerates_randomCode_persists_and_warmsCache() {
         UrlDto dto = new UrlDto();
-        dto.setLongUrl("wikipedia.org"); // no scheme; service should normalize
+        dto.setLongUrl("wikipedia.org"); // will be normalized to http://wikipedia.org
+        dto.setExpirationDate(Instant.parse("2027-01-01T00:00:00Z"));
 
-        // Act
-        String code = urlService.convertToShortUrl(dto);
+        when(repo.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
-        // Assert
-        assertEquals("j", code);
-        verify(mockIdSequence).next();
-        verify(mockValueOps).set(eq("url:code:j"),
-                eq("http://wikipedia.org"),
-                any(Duration.class));
+        try (var mocked = Mockito.mockStatic(Base62Generator.class)) {
+            mocked.when(() -> Base62Generator.randomCode(anyInt())).thenReturn("aB9x2Q7");
+
+            String code = service.convertToShortUrl(dto);
+            assertEquals("aB9x2Q7", code);
+
+            ArgumentCaptor<Url> cap = ArgumentCaptor.forClass(Url.class);
+            verify(repo).save(cap.capture());
+            assertEquals("aB9x2Q7", cap.getValue().getCode());
+            assertEquals("http://wikipedia.org", cap.getValue().getLongUrl()); // normalized
+            assertEquals(dto.getExpirationDate(), cap.getValue().getExpiresAt());
+
+            verify(cache).set("aB9x2Q7", "http://wikipedia.org", dto.getExpirationDate());
+        }
+    }
+
+    @Test
+    void create_retries_on_duplicateKey_then_succeeds() {
+        UrlDto dto = new UrlDto();
+        dto.setLongUrl("https://example.com/page");
+
+        // First save throws duplicate key (code collision), second succeeds
+        when(repo.save(any()))
+                .thenThrow(new DataIntegrityViolationException("duplicate code"))
+                .thenAnswer(inv -> inv.getArgument(0));
+
+        try (var mocked = Mockito.mockStatic(Base62Generator.class)) {
+            mocked.when(() -> Base62Generator.randomCode(anyInt()))
+                    .thenReturn("dupCode", "okCode");
+
+            String code = service.convertToShortUrl(dto);
+            assertEquals("okCode", code);
+        }
+
+        // verify two attempts to save
+        verify(repo, times(2)).save(any(Url.class));
+        // cache warmed with the winning code
+        verify(cache).set(eq("okCode"), eq("https://example.com/page"), isNull());
+    }
+
+    @Test
+    void resolve_cacheHit_returnsImmediately() {
+        when(cache.get("abc")).thenReturn("https://target.com/");
+
+        String url = service.getOriginalUrl("abc");
+
+        assertEquals("https://target.com/", url);
+        verifyNoInteractions(repo);
+    }
+
+    @Test
+    void resolve_cacheMiss_dbHit_then_warmCache_and_return() {
+        when(cache.get("xyz")).thenReturn(null);
+
+        Url e = new Url();
+        e.setCode("xyz");
+        e.setLongUrl("https://target.com/");
+        e.setExpiresAt(Instant.parse("2030-01-01T00:00:00Z"));
+
+        when(repo.findById("xyz")).thenReturn(Optional.of(e));
+
+        String url = service.getOriginalUrl("xyz");
+
+        assertEquals("https://target.com/", url);
+        verify(cache).set("xyz", "https://target.com/", e.getExpiresAt());
+    }
+
+    @Test
+    void resolve_notFound_or_expired_throws() {
+        when(cache.get("gone")).thenReturn(null);
+        when(repo.findById("gone")).thenReturn(Optional.empty());
+
+        assertThrows(EntityNotFoundException.class, () -> service.getOriginalUrl("gone"));
     }
 }

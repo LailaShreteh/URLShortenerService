@@ -1,16 +1,29 @@
 # URL Shortener Service:
 
-Spring Boot service that creates short codes using a Redis atomic counter + Base62.
- ### steps to run :
-1- run redis on docker
-```bash
-docker run --name urlshort-redis -p 6379:6379 -d redis:7-alpine
-```
-2- then run the spring app
-```bash
-mvn spring-boot:run
+Random (SecureRandom) Base62 + Postgres + Redis design
 
+### steps to run :
+1- run docker from the project root 
+```bash
+docker compose up --build
 ```
+### What it does
+ * Create (POST /create-short, JSON body UrlDto):
+   - Validates and normalizes the input URL (adds http:// if missing).
+   - If alias is provided → uses it as the code (DB enforces uniqueness).
+   - Otherwise generates an 8-char Base62 code with SecureRandom.
+   - Persists {code, long_url, created_at, expires_at, is_custom} in Postgres.
+   - Warms Redis cache: code:{code} → long_url with TTL clamped to expires_at.
+   - Returns the code as text/plain.
+* Redirect (GET /{code}):
+  - Reads Redis first; on hit → 302 Location to the original URL.
+  - On miss → loads from Postgres, checks not expired, warms cache, returns 302.
+  - 404 if not found, 410 if expired.
+* Why this design
+  - No global counter / no hot key → easy horizontal & multi-region scaling.
+  - Fast & simple: O(1) generation w.r.t. URL length; DB UNIQUE on code guarantees no duplicates (retry on the rare collision).
+  - Great cache fit: read-heavy traffic is served from Redis and CDN.
+
 
 ## 1- Requirements:
 
@@ -87,7 +100,23 @@ Algorithm: there is three approaches here :
 4- use Counter
 ```
 I descided to use unique Counter with Base62 Encoding
+and
 
+Let’s keep Users in Postgres/MySQL (durable, constraints, backups) and use Redis for what it does best: counter + hot cache + rate limits + alias reservations. This preserves sub-100ms redirects while keeping user data safe, queryable, and compliant.
+
+### Why
+
+  - **Durability & constraints:** Unique email/username, foreign keys, migrations, PITR → native in Postgres/MySQL.
+  - **Querying:** Ad-hoc search, pagination, auditing without rolling our own indexes.
+  - **Cost & ops:** Users on disk is cheaper and simpler to back up/restore than in-RAM storage.
+  - **Performance:** Redirect path remains Redis-backed (code→url) + CDN; writes stay simple via Redis INCR.
+
+What Redis is for in our design
+
+- Atomic ID counter (INCR) for short codes
+- Hot cache code → url with TTL
+- Rate limiting (per IP/user)
+- Alias reservation (SETNX reserved:{alias} with TTL)
 ### WHY THIS APPROCH!
 ``` 
 Unique Counter with Base62 Encoding
@@ -119,6 +148,34 @@ Thus, the system can accommodate billions of URLs while keeping short codes comp
 Challenges
 In a distributed deployment, maintaining a single global counter is more complex because all primary server instances must remain synchronized on counter values. This synchronization challenge will be addressed further when discussing system scaling strategies.
 ```
+### Schema
+```sql
+(Postgres/MySQL)
+-- Users = system of record
+CREATE TABLE users (
+id            BIGSERIAL PRIMARY KEY,     -- or BIGINT AUTO_INCREMENT
+email         CITEXT UNIQUE NOT NULL,    -- use VARCHAR UNIQUE if MySQL
+password_hash TEXT NOT NULL,
+created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+status        SMALLINT NOT NULL DEFAULT 1 -- 1=active, 2=disabled
+);
+
+-- Short URLs
+CREATE TABLE short_urls (
+code         VARCHAR(10) PRIMARY KEY,
+long_url     TEXT NOT NULL,
+user_id      BIGINT REFERENCES users(id),
+created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+expires_at   TIMESTAMPTZ,
+is_custom    BOOLEAN NOT NULL DEFAULT FALSE,
+status       SMALLINT NOT NULL DEFAULT 1  -- 1=active, 2=expired, 3=deleted
+);
+
+CREATE INDEX idx_short_urls_user    ON short_urls(user_id);
+CREATE INDEX idx_short_urls_expires ON short_urls(expires_at);
+-- idempotency:
+CREATE UNIQUE INDEX IF NOT EXISTS uq_short_urls_url_hash ON short_urls(url_hash);
+```
 ### Note that:
 ``` Pattern: Scaling Reads
 URL shorteners showcase the extreme read-to-write ratio that makes scaling reads critical. With potentially millions of clicks per shortened URL, aggressive caching strategies become essential.
@@ -131,3 +188,59 @@ To solve this:
 ### Final design:
 
 ![Screenshot 2025-09-18 202118.png](Screenshot%202025-09-18%20202118.png)
+
+### Alternative designs:
+I considered two approaches to generate unique short codes:
+* Counter-less (chosen): Random Base62 codes (length 7–8) + DB UNIQUE/PK + retry on duplicate.
+* Central Counter (alternative): Redis INCRBY with counter batching (writers lease ranges).
+
+I chose (1) for simplicity, reliability, and easy horizontal/multi-region scaling.
+
+### 1- Counter-less Random Base62
+ How it works
+```bash
+On create, generate a random Base62 code (length L=7 or 8) 
+using a CSPRNG (SecureRandom).
+Insert into DB where code is PRIMARY KEY/UNIQUE.
+If insert fails with duplicate key, 
+generate a new code and retry (rare).
+ ```
+  Why this is preferred
+- No global bottleneck (no shared counter).
+- Scales across regions with zero coordination.
+- Retries are negligible when L ≥ 7 (use 8 for near-zero collision odds).
+- Uniform key distribution (nice for sharding/partitions).
+
+### 2- Central Counter with Batching (Redis)
+  What it is
+```bash 
+- A single Redis key holds the high-water mark.
+- Writers lease blocks via INCRBY counter, blockSize (e.g., 1000).
+- They allocate from their local block without more Redis calls until exhausted.
+```
+ Strengths
+- Simple logic; ordered numeric IDs.
+- Minimal per-write overhead (one network call per block).
+
+ Risks / Complexity
+  - Single logical source of truth (hot key/blast radius).
+ - Failover consistency (must ensure the counter is not rolled back on promotion).
+ - Multi-region is tricky without prefixes or strong consistency.
+ 
+Mitigations
+- Enable AOF, set min-replicas-to-write, use WAIT before returning batches.
+ - Or use a strongly consistent Redis deployment.
+- For multi-region, add a short region/shard prefix to codes to avoid overlap.
+
+
+### When to Choose Which
+
+| Scenario | Counter-less (random) | Counter + batching |
+| --- | --- | --- |
+| Horizontal / multi-region scaling | **Excellent** (no coordination) | Needs careful design (prefixes/consistency) |
+| Simplicity & ops overhead | **Simple** | More moving parts (AOF/replication/WAIT) |
+| Ordered identifiers needed | Not ordered (use `created_at`/ULID) | **Yes** (monotonic) |
+| Throughput / latency | **Great** (single DB insert; rare retry) | Great (amortized Redis calls) |
+
+So Finally : Counter-less random Base62 (L=8) + DB UNIQUE + retry.
+Keep Redis for cache, rate-limits, and alias reservations—not for a global counter.

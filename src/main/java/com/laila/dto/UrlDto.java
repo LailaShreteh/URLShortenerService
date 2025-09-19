@@ -1,30 +1,34 @@
 package com.laila.dto;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
 
-import java.util.Date;
+import java.time.Instant;
 
-@Schema(name = "UrlCreateRequest", description = "Request to create a short URL")
+@JsonInclude(JsonInclude.Include.NON_NULL)
+@Schema(name = "UrlDto", description = "Request to shorten a URL (alias/expiration optional)")
 public class UrlDto {
-    @Schema(description = "Original URL to shorten", example = "https://www.wikipedia.org", requiredMode = Schema.RequiredMode.REQUIRED)
+
     @NotBlank
+    @Size(max = 2048, message = "URL is too long")
+    @Pattern(regexp = "https?://.+", message = "URL must start with http:// or https://")
+    @Schema(description = "Absolute target URL", example = "https://www.example.com/some/long/url")
     private String longUrl;
 
-    @Schema(description = "Short url/ alias")
-    private String shortUrl;
+    // Optional custom alias; server enforces uniqueness in DB
+    @Size(min = 3, max = 32, message = "Alias must be 3–32 characters")
+    @Pattern(regexp = "^[A-Za-z0-9_-]+$", message = "Alias may contain letters, numbers, _ and - only")
+    @Schema(description = "Optional custom short code (must be unique)", example = "docs123")
+    private String alias;
 
-    @Schema(description = "Optional TTL in seconds (Redis expiry). Null/0 = never expire", example = "86400")
-    private Long ttlSeconds;
+    @Schema(description = "Optional expiration instant", example = "2026-12-31T23:59:59Z")
+    private Instant expirationDate;
 
-    @Schema(description = "Expiration datetime of url")
-    private Date expirationDate;
-
-    @Schema(description = "Creation time of url")
-    private Date creationDate;
-
-    @Schema(description = "Optional user id who owns the link", example = "user-123")
-    private String userId;
+    @Schema(description = "Optional owning user id")
+    private Long userId;
 
     public String getLongUrl() {
         return longUrl;
@@ -34,43 +38,27 @@ public class UrlDto {
         this.longUrl = longUrl;
     }
 
-    public String getShortUrl() {
-        return shortUrl;
+    public String getAlias() {
+        return alias;
     }
 
-    public Date getExpirationDate() {
+    public void setAlias(String alias) {
+        this.alias = alias;
+    }
+
+    public Instant getExpirationDate() {
         return expirationDate;
     }
 
-    public Date getCreationDate() {
-        return creationDate;
-    }
-
-    public void setShortUrl(String shortUrl) {
-        this.shortUrl = shortUrl;
-    }
-
-    public void setExpirationDate(Date expirationDate) {
+    public void setExpirationDate(Instant expirationDate) {
         this.expirationDate = expirationDate;
     }
 
-    public void setCreationDate(Date creationDate) {
-        this.creationDate = creationDate;
-    }
-
-    public void setUserId(String userId) {
-        this.userId = userId;
-    }
-
-    public String getUserId() {
+    public Long getUserId() {
         return userId;
     }
 
-    public Long getTtlSeconds() {
-        return ttlSeconds;
-    }
-
-    public void setTtlSeconds(Long ttlSeconds) {
-        this.ttlSeconds = ttlSeconds;
+    public void setUserId(Long userId) {
+        this.userId = userId;
     }
 }
