@@ -7,24 +7,6 @@ Random (SecureRandom) Base62 + Postgres + Redis design
 ```bash
 docker compose up --build
 ```
-### What it does
- * Create (POST /create-short, JSON body UrlDto):
-   - Validates and normalizes the input URL (adds http:// if missing).
-   - If alias is provided → uses it as the code (DB enforces uniqueness).
-   - Otherwise generates an 8-char Base62 code with SecureRandom.
-   - Persists {code, long_url, created_at, expires_at, is_custom} in Postgres.
-   - Warms Redis cache: code:{code} → long_url with TTL clamped to expires_at.
-   - Returns the code as text/plain.
-* Redirect (GET /{code}):
-  - Reads Redis first; on hit → 302 Location to the original URL.
-  - On miss → loads from Postgres, checks not expired, warms cache, returns 302.
-  - 404 if not found, 410 if expired.
-* Why this design
-  - No global counter / no hot key → easy horizontal & multi-region scaling.
-  - Fast & simple: O(1) generation w.r.t. URL length; DB UNIQUE on code guarantees no duplicates (retry on the rare collision).
-  - Great cache fit: read-heavy traffic is served from Redis and CDN.
-
-
 ## 1- Requirements:
 
 ### Functional requirements:
@@ -195,6 +177,25 @@ I considered two approaches to generate unique short codes:
 * Central Counter (alternative): Redis INCRBY with counter batching (writers lease ranges).
 
 I chose (1) for simplicity, reliability, and easy horizontal/multi-region scaling.
+
+
+### What it does
+ * Create (POST /create-short, JSON body UrlDto):
+   - Validates and normalizes the input URL (adds http:// if missing).
+   - If alias is provided → uses it as the code (DB enforces uniqueness).
+   - Otherwise generates an 8-char Base62 code with SecureRandom.
+   - Persists {code, long_url, created_at, expires_at, is_custom} in Postgres.
+   - Warms Redis cache: code:{code} → long_url with TTL clamped to expires_at.
+   - Returns the code as text/plain.
+* Redirect (GET /{code}):
+  - Reads Redis first; on hit → 302 Location to the original URL.
+  - On miss → loads from Postgres, checks not expired, warms cache, returns 302.
+  - 404 if not found, 410 if expired.
+* Why this design
+  - No global counter / no hot key → easy horizontal & multi-region scaling.
+  - Fast & simple: O(1) generation w.r.t. URL length; DB UNIQUE on code guarantees no duplicates (retry on the rare collision).
+  - Great cache fit: read-heavy traffic is served from Redis and CDN.
+
 
 ### 1- Counter-less Random Base62
  How it works
